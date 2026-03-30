@@ -4,7 +4,7 @@ from torch.nn import functional as F
 from einops import repeat
 
 from .models import register_backbone
-from .blocks import (get_sinusoid_encoding, TransformerBlock, MaskedConv1D, MutilModelTransformerBlock,ConvBlock, LayerNorm)
+from .blocks import (get_sinusoid_encoding, TransformerBlock, MaskedConv1D, MutilModelTransformerBlock, ConvBlock, LayerNorm, SwinBlock1D)
 
 
 @register_backbone("convTransformer")
@@ -291,6 +291,8 @@ class ConvHRLRFullResSelfAttTransformerBackboneRevised(nn.Module):
         use_abs_pe = False,    # use absolute position embedding
         use_rel_pe = False,    # use relative position embedding
         use_time_weight = False, # use time weight embedding
+        tfaa_on = True,        # enable TFAA path
+        pca_on = True,         # enable PCA-FPN path
     ):
         super().__init__()
         assert len(arch) == 3
@@ -304,6 +306,8 @@ class ConvHRLRFullResSelfAttTransformerBackboneRevised(nn.Module):
         self.use_abs_pe = use_abs_pe
         self.use_rel_pe = use_rel_pe
         self.use_time_weight = use_time_weight
+        self.tfaa_on = tfaa_on
+        self.pca_on = pca_on
         
         # feature projection
         self.n_in = n_in
@@ -423,34 +427,37 @@ class ConvHRLRFullResSelfAttTransformerBackboneRevised(nn.Module):
                     for proj, s in zip(self.proj, x.split(self.n_in, dim=1))
                 ], dim=1
             )
-            norm_x = torch.cat(
-                [proj(s, mask)[0] \
-                    for proj, s in zip(self.proj, norm_x.split(self.n_in, dim=1))
-                ], dim=1
-            )
-            reco_x = torch.cat(
-                [proj(s, mask)[0] \
-                    for proj, s in zip(self.proj, reco_x.split(self.n_in, dim=1))
-                ], dim=1
-            )
+            if self.tfaa_on:
+                norm_x = torch.cat(
+                    [proj(s, mask)[0] \
+                        for proj, s in zip(self.proj, norm_x.split(self.n_in, dim=1))
+                    ], dim=1
+                )
+                reco_x = torch.cat(
+                    [proj(s, mask)[0] \
+                        for proj, s in zip(self.proj, reco_x.split(self.n_in, dim=1))
+                    ], dim=1
+                )
         # embedding network
         for idx in range(len(self.embd)):
             x, mask = self.embd[idx](x, mask)
             x = self.relu(self.embd_norm[idx](x))
-            
-            norm_x, _ = self.embd[idx](norm_x, mask)
-            norm_x = self.relu(self.embd_norm[idx](norm_x))
-            
-            reco_x, _ = self.embd[idx](reco_x, mask)
-            reco_x = self.relu(self.embd_norm[idx](reco_x))
+
+            if self.tfaa_on:
+                norm_x, _ = self.embd[idx](norm_x, mask)
+                norm_x = self.relu(self.embd_norm[idx](norm_x))
+
+                reco_x, _ = self.embd[idx](reco_x, mask)
+                reco_x = self.relu(self.embd_norm[idx](reco_x))
         # training: using fixed length position embeddings
         if self.use_abs_pe and self.training:
             assert T <= self.max_len, "Reached max length."
             pe = self.pos_embd
             # add pe to x
             x = x + pe[:, :, :T] * mask.to(x.dtype)
-            norm_x = norm_x + pe[:, :, :T] * mask.to(x.dtype)
-            reco_x = reco_x + pe[:, :, :T] * mask.to(x.dtype)
+            if self.tfaa_on:
+                norm_x = norm_x + pe[:, :, :T] * mask.to(x.dtype)
+                reco_x = reco_x + pe[:, :, :T] * mask.to(x.dtype)
 
         # inference: re-interpolate position embeddings for over-length sequences
         if self.use_abs_pe and (not self.training):
@@ -461,35 +468,139 @@ class ConvHRLRFullResSelfAttTransformerBackboneRevised(nn.Module):
                 pe = self.pos_embd
             # add pe to x
             x = x + pe[:, :, :T] * mask.to(x.dtype)
-            norm_x = norm_x + pe[:, :, :T] * mask.to(x.dtype)
-            reco_x = reco_x + pe[:, :, :T] * mask.to(x.dtype)
+            if self.tfaa_on:
+                norm_x = norm_x + pe[:, :, :T] * mask.to(x.dtype)
+                reco_x = reco_x + pe[:, :, :T] * mask.to(x.dtype)
 
-        x = self.resselfattention(x,mask, x_k=reco_x, mask_k=mask, x_v=x, mask_v=mask)[0]
+        if self.tfaa_on:
+            x = self.resselfattention(x,mask, x_k=reco_x, mask_k=mask, x_v=x, mask_v=mask)[0]
         
         # stem transformer
         for idx in range(len(self.stem)):
             x, mask = self.stem[idx](x, mask)
 
-        # reco x encoder
-        # feature projection
+        if not self.pca_on:
+            out_feats = (x, )
+            out_masks = (mask, )
+            for idx in range(len(self.branch)):
+                x, mask = self.branch[idx](x, mask)
+                out_feats += (x, )
+                out_masks += (mask, )
+            return out_feats, out_masks
 
         # prep for outputs
-        # out_feats = (x, )
-        # out_masks = (mask, )
-        lh_feat=x
-        lh_mask=mask
+        lh_feat = x
+        lh_mask = mask
         out_feats = [lh_feat]
-        out_masks = [lh_mask]        
+        out_masks = [lh_mask]
         # main branch with downsampling
-        x,mask = lh_feat,lh_mask
+        x, mask = lh_feat, lh_mask
         for idx in range(len(self.branch)):
             x, mask = self.branch[idx](x, mask)
-            lh_feat, lh_mask = self.lh_branch[idx](lh_feat, lh_mask, x_k=F.interpolate(x, scale_factor=self.scale_factor**(idx+1), mode='nearest'), mask_k=lh_mask, x_v=F.interpolate(x, scale_factor=self.scale_factor**(idx+1), mode='nearest'), mask_v=lh_mask)
+            lh_feat, lh_mask = self.lh_branch[idx](
+                lh_feat, lh_mask,
+                x_k=F.interpolate(x, scale_factor=self.scale_factor**(idx+1), mode='nearest'),
+                mask_k=lh_mask,
+                x_v=F.interpolate(x, scale_factor=self.scale_factor**(idx+1), mode='nearest'),
+                mask_v=lh_mask
+            )
             out_feats.append(x)
             out_masks.append(mask)
-            x, mask = self.hh_branch[idx](x, mask, x_k=F.interpolate(lh_feat, scale_factor=1/(self.scale_factor**(idx+1)), mode='nearest'), mask_k=mask, x_v=F.interpolate(lh_feat, scale_factor=1/(self.scale_factor**(idx+1)), mode='nearest'), mask_v=mask)
-            # x = x + F.interpolate(lh_feat, scale_factor=1/(self.scale_factor**(idx+1)))
+            x, mask = self.hh_branch[idx](
+                x, mask,
+                x_k=F.interpolate(lh_feat, scale_factor=1/(self.scale_factor**(idx+1)), mode='nearest'),
+                mask_k=mask,
+                x_v=F.interpolate(lh_feat, scale_factor=1/(self.scale_factor**(idx+1)), mode='nearest'),
+                mask_v=mask
+            )
         out_feats[0] = lh_feat
         out_masks[0] = lh_mask
 
         return out_feats, out_masks
+
+
+@register_backbone("convHRLRSwin")
+class ConvHRLRSwin(ConvHRLRFullResSelfAttTransformerBackboneRevised):
+    """
+    Minimal-intrusion variant: replace stem/branch transformer blocks with SwinBlock1D.
+    """
+    def __init__(
+        self,
+        n_in,
+        n_embd,
+        n_head,
+        n_embd_ks,
+        max_len,
+        arch=(2, 2, 5),
+        mha_win_size=[-1] * 6,
+        scale_factor=2,
+        with_ln=False,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_abs_pe=False,
+        use_rel_pe=False,
+        use_time_weight=False,
+        tfaa_on=True,
+        pca_on=True,
+    ):
+        super().__init__(
+            n_in=n_in,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_embd_ks=n_embd_ks,
+            max_len=max_len,
+            arch=arch,
+            mha_win_size=mha_win_size,
+            scale_factor=scale_factor,
+            with_ln=with_ln,
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+            path_pdrop=path_pdrop,
+            use_abs_pe=use_abs_pe,
+            use_rel_pe=use_rel_pe,
+            use_time_weight=use_time_weight,
+            tfaa_on=tfaa_on,
+            pca_on=pca_on,
+        )
+
+        # Replace stem with shifted-window attention blocks.
+        stem_win = self.mha_win_size[0] if self.mha_win_size[0] > 1 else 7
+        stem_shift = stem_win // 2
+        self.stem = nn.ModuleList([
+            SwinBlock1D(
+                n_embd=n_embd,
+                n_head=n_head,
+                window_size=stem_win,
+                shift_size=(0 if (idx % 2 == 0) else stem_shift),
+                n_ds_stride=1,
+                attn_pdrop=attn_pdrop,
+                proj_pdrop=proj_pdrop,
+                path_pdrop=path_pdrop,
+                use_rel_pe=self.use_rel_pe,
+                use_time_weight=self.use_time_weight,
+            )
+            for idx in range(arch[1])
+        ])
+
+        # Replace branch with shifted-window attention blocks (keep pyramid strides).
+        self.branch = nn.ModuleList()
+        for idx in range(arch[2]):
+            win = self.mha_win_size[1 + idx]
+            if win <= 1:
+                win = 7
+            shift = win // 2
+            self.branch.append(
+                SwinBlock1D(
+                    n_embd=n_embd,
+                    n_head=n_head,
+                    window_size=win,
+                    shift_size=(0 if (idx % 2 == 0) else shift),
+                    n_ds_stride=self.scale_factor,
+                    attn_pdrop=attn_pdrop,
+                    proj_pdrop=proj_pdrop,
+                    path_pdrop=path_pdrop,
+                    use_rel_pe=self.use_rel_pe,
+                    use_time_weight=self.use_time_weight,
+                )
+            )

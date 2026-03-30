@@ -24,15 +24,12 @@ def fix_random_seed(seed, include_cuda=True):
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     if include_cuda:
-        # training: disable cudnn benchmark to ensure the reproducibility
+        # keep random seeds but allow faster non-deterministic kernels
         cudnn.enabled = True
-        cudnn.benchmark = False
-        cudnn.deterministic = True
+        cudnn.benchmark = True
+        cudnn.deterministic = False
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        # this is needed for CUDA >= 10.2
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-        torch.use_deterministic_algorithms(True, warn_only=True)
     else:
         cudnn.enabled = True
         cudnn.benchmark = True
@@ -277,8 +274,14 @@ def train_one_epoch(
     curr_epoch,
     model_ema = None,
     clip_grad_l2norm = -1,
+    use_amp = False,
+    amp_scale = None,
     tb_writer = None,
-    print_freq = 20
+    print_freq = 20,
+    refine_on = False,
+    refine_start = 0,
+    pre_w = 0.0,
+    refine_w = 0.0,
 ):
     """Training the model for one epoch"""
     # set up meters
@@ -291,21 +294,39 @@ def train_one_epoch(
 
     # main training loop
     print("\n[Train]: Epoch {:d} started".format(curr_epoch))
+    if refine_on:
+        core = model.module if hasattr(model, "module") else model
+        cur_w = pre_w if curr_epoch < refine_start else refine_w
+        if hasattr(core, "refine_w"):
+            core.refine_w = cur_w
+        print("[Train]: refine_w={:.3f} (start={:d}, pre_w={:.3f})".format(
+            cur_w, refine_start, pre_w
+        ))
     start = time.time()
     for iter_idx, video_list in enumerate(train_loader, 0):
         # zero out optim
         optimizer.zero_grad(set_to_none=True)
         # forward / backward the model
-        losses = model(video_list)
-        losses['final_loss'].backward()
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            losses = model(video_list)
+        if (amp_scale is not None) and use_amp:
+            amp_scale.scale(losses['final_loss']).backward()
+        else:
+            losses['final_loss'].backward()
         # gradient cliping (to stabilize training if necessary)
         if clip_grad_l2norm > 0.0:
+            if (amp_scale is not None) and use_amp:
+                amp_scale.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 clip_grad_l2norm
             )
         # step optimizer / scheduler
-        optimizer.step()
+        if (amp_scale is not None) and use_amp:
+            amp_scale.step(optimizer)
+            amp_scale.update()
+        else:
+            optimizer.step()
         scheduler.step()
 
         if model_ema is not None:
@@ -314,7 +335,8 @@ def train_one_epoch(
         # printing (only check the stats when necessary to avoid extra cost)
         if (iter_idx != 0) and (iter_idx % print_freq) == 0:
             # measure elapsed time (sync all kernels)
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             batch_time.update((time.time() - start) / print_freq)
             start = time.time()
 
@@ -392,6 +414,8 @@ def valid_one_epoch(
     subset= 'test',
     tiou_thre=np.linspace(0.5, 1.0, 11),
     max_avg_nr_proposal=100,
+    topk_out=100,
+    eval_jobs=16,
     dataset_name=''
 ):
     """Test the model on the validation set"""
@@ -456,7 +480,15 @@ def valid_one_epoch(
         # call the evaluator
         _, mAP, _ = evaluator.evaluate(results, verbose=True)
     elif 'json' in output_file:
-        mAP,_ = run_evaluation(results, gt_file,output_file, max_avg_nr_proposal=max_avg_nr_proposal,tiou_thre=tiou_thre,subset=subset,cls_score_file=ext_score_file)   
+        mAP,_ = run_evaluation(
+            results, gt_file, output_file,
+            max_avg_nr_proposal=max_avg_nr_proposal,
+            tiou_thre=tiou_thre,
+            subset=subset,
+            cls_score_file=ext_score_file,
+            topk_out=topk_out,
+            eval_jobs=eval_jobs
+        )
     else:
         # dump to a pickle file that can be directly used for evaluation
         with open(output_file, "wb") as f:

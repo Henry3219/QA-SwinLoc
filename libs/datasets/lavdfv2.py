@@ -2,6 +2,8 @@ import os
 import json
 import h5py
 import numpy as np
+import pickle
+import hashlib
 
 import torch
 from torch.utils.data import Dataset
@@ -33,7 +35,9 @@ class LAVDFDataset(Dataset):
         file_prefix,      # feature file prefix if any
         file_ext,         # feature file extension if any
         audio_file_ext,  # audio feature file extension if any
-        force_upsampling  # force to upsample to max_seq_len
+        force_upsampling,  # force to upsample to max_seq_len
+        use_cache=True,    # cache dataset index
+        cache_file=None    # custom cache file path
     ):
         # file path
         assert os.path.exists(feat_folder) and os.path.exists(json_file)
@@ -48,6 +52,8 @@ class LAVDFDataset(Dataset):
         self.file_ext = file_ext
         self.audio_file_ext=audio_file_ext
         self.json_file = json_file
+        self.use_cache = use_cache
+        self.cache_file = cache_file
 
         # anet uses fixed length features, make sure there is no downsampling
         self.force_upsampling = force_upsampling
@@ -82,10 +88,45 @@ class LAVDFDataset(Dataset):
             'empty_label_ids': []
         }
         print("{} subset has {} videos".format(self.split,len(self.data_list)))
+
+    def _cache_path(self):
+        if self.cache_file is not None:
+            return self.cache_file
+        key = {
+            'json_file': self.json_file,
+            'feat_folder': self.feat_folder,
+            'audio_feat_folder': self.audio_feat_folder,
+            'split': list(self.split),
+            'file_prefix': self.file_prefix,
+            'file_ext': self.file_ext,
+            'audio_file_ext': self.audio_file_ext,
+            'default_fps': self.default_fps
+        }
+        key_raw = json.dumps(key, sort_keys=True, default=str)
+        key_id = hashlib.md5(key_raw.encode('utf-8')).hexdigest()[:12]
+        base = os.path.basename(self.json_file)
+        return os.path.join(
+            os.path.dirname(self.json_file),
+            ".{}_{}.lavdfv2.pkl".format(base, key_id)
+        )
     def get_attributes(self):
         return self.db_attributes
 
     def _load_json_db(self, json_file):
+        cache_path = self._cache_path()
+        if self.use_cache and os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as fid:
+                    payload = pickle.load(fid)
+                if isinstance(payload, dict) and ('data' in payload):
+                    dict_db = payload['data']
+                else:
+                    dict_db = payload
+                print("Loaded index cache:", cache_path)
+                return tuple(dict_db)
+            except Exception as e:
+                print("Index cache read failed, rebuild:", e)
+
         # load database and select the subset
         with open(json_file, 'r') as fid:
             json_db = json.load(fid)
@@ -150,6 +191,17 @@ class LAVDFDataset(Dataset):
                          'av_labels': av_labels
             }, )
 
+        if self.use_cache:
+            try:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                tmp_path = cache_path + ".tmp"
+                with open(tmp_path, 'wb') as fid:
+                    pickle.dump({'data': dict_db}, fid, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp_path, cache_path)
+                print("Saved index cache:", cache_path)
+            except Exception as e:
+                print("Index cache write failed:", e)
+
         return dict_db
 
     def __len__(self):
@@ -183,7 +235,7 @@ class LAVDFDataset(Dataset):
         if self.audio_feat_folder is not None:
             audio_filename = os.path.join(self.audio_feat_folder,video_item['split'],
                         video_item['id'] + self.file_ext)
-            audio_feats = np.load(audio_filename)
+            audio_feats = np.load(audio_filename).astype(np.float32)
         
 
         # we support both fixed length features / variable length features

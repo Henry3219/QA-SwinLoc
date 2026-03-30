@@ -1314,6 +1314,49 @@ class TransformerBlock(nn.Module):
             out += pos_embd * out_mask_float
         return out, out_mask
 
+class SwinBlock1D(nn.Module):
+    """
+    Shifted-window Transformer block on 1D temporal tokens.
+    """
+    def __init__(
+        self,
+        n_embd,
+        n_head,
+        window_size,
+        shift_size=0,
+        n_ds_stride=1,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_rel_pe=False,
+        use_time_weight=False,
+    ):
+        super().__init__()
+        self.shift_size = max(0, shift_size)
+        self.block = TransformerBlock(
+            n_embd=n_embd,
+            n_head=n_head,
+            n_ds_strides=(n_ds_stride, n_ds_stride),
+            attn_pdrop=attn_pdrop,
+            proj_pdrop=proj_pdrop,
+            path_pdrop=path_pdrop,
+            mha_win_size=window_size,
+            use_rel_pe=use_rel_pe,
+            use_time_weight=use_time_weight,
+        )
+
+    def forward(self, x, mask, pos_embd=None):
+        if self.shift_size <= 0:
+            return self.block(x, mask, pos_embd=pos_embd)
+
+        # Shift temporal tokens before local attention, then roll back.
+        x_s = torch.roll(x, shifts=-self.shift_size, dims=-1)
+        m_s = torch.roll(mask, shifts=-self.shift_size, dims=-1)
+        out, out_mask = self.block(x_s, m_s, pos_embd=pos_embd)
+        out = torch.roll(out, shifts=self.shift_size, dims=-1)
+        out_mask = torch.roll(out_mask, shifts=self.shift_size, dims=-1)
+        return out, out_mask
+
 
 class ConvBlock(nn.Module):
     """

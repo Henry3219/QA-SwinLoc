@@ -182,7 +182,7 @@ class LAVDFDataset(Dataset):
         if self.audio_feat_folder is not None:
             audio_filename = os.path.join(self.audio_feat_folder,video_item['split'],
                         video_item['id'] + self.file_ext)
-            audio_feats = np.load(audio_filename)
+            audio_feats = np.load(audio_filename).astype(np.float32)
         
 
         # we support both fixed length features / variable length features

@@ -82,12 +82,30 @@ DEFAULTS = {
         "use_abs_pe": False,
         # use rel position encoding (added to self-attention)
         "use_rel_pe": False,
+        # switches for optional heavy modules
+        "tfaa_on": True,
+        "pca_on": True,
+        "refine_on": False,
+        "refine_w": 0.0,
+        "refine_start": 0,
+        "pre_w": 0.0,
+        "dfl_on": False,
+        "dfl_w": 0.0,
+        "dfl_bin": 16,
+        "qual_on": False,
+        "gate_on": False,
+        "gate_dim": 256,
     },
     "train_cfg": {
         # radius | none (if to use center sampling)
         "center_sample": "radius",
         "center_sample_radius": 1.5,
         "loss_weight": 1.0, # on reg_loss, use -1 to enable auto balancing
+        "con_on": True,
+        "con_w": 0.05,
+        "con_t": 0.7,
+        "qual_w": 1.0,
+        "gate_w": 0.1,
         "cls_prior_prob": 0.01,
         "init_loss_norm": 2000,
         # gradient cliping, not needed for pre-LN transformer
@@ -100,6 +118,8 @@ DEFAULTS = {
         "droppath": 0.1,
         # if to use label smoothing (>0.0)
         "label_smoothing": 0.0,
+        # enable EMA model tracking
+        "use_ema": True,
     },
     "test_cfg": {
         "pre_nms_thresh": 0.001,
@@ -109,10 +129,18 @@ DEFAULTS = {
         "max_seg_num": 1000,
         "nms_method": 'soft', # soft | hard | none
         "nms_sigma" : 0.5,
+        "adapt_nms": False,
+        "len_thr": 0.7,
+        "sigma_s": 0.5,
+        "sigma_l": 0.5,
         "duration_thresh": 0.05,
         "multiclass_nms": True,
         "ext_score_file": None,
         "voting_thresh" : 0.75,
+        "export_topk": 100,
+        "eval_jobs": 16,
+        "qual_mul": True,
+        "gate_mul": True,
     },
     # optimizer (for training)
     "opt": {
@@ -147,6 +175,28 @@ def load_default_config():
     return config
 
 def _update_config(config):
+    # optional dataset preset switch for fast full/subset toggling
+    data_mode = config.get("data_mode", None)
+    data_map = config.get("data_map", None)
+    if (data_mode is not None) and (data_map is not None):
+        if data_mode not in data_map:
+            raise KeyError(f"Unknown data_mode: {data_mode}")
+        config["dataset"].update(data_map[data_mode])
+
+    # optional audio preset switch for fast byola/wav2vec toggling
+    audio_mode = config.get("audio_mode", None)
+    audio_map = config.get("audio_map", None)
+    if (audio_mode is not None) and (audio_map is not None):
+        if audio_mode not in audio_map:
+            raise KeyError(f"Unknown audio_mode: {audio_mode}")
+        audio_cfg = audio_map[audio_mode]
+        if data_mode is not None and data_mode in audio_cfg:
+            config["dataset"]["audio_feat_folder"] = audio_cfg[data_mode]
+        elif "audio_feat_folder" in audio_cfg:
+            config["dataset"]["audio_feat_folder"] = audio_cfg["audio_feat_folder"]
+        if "audio_input_dim" in audio_cfg:
+            config["dataset"]["audio_input_dim"] = audio_cfg["audio_input_dim"]
+
     # fill in derived fields
     config["model"]["input_dim"] = config["dataset"]["input_dim"] 
     config["model"]["audio_input_dim"] = config["dataset"]["audio_input_dim"]

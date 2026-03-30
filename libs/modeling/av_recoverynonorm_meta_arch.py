@@ -6,7 +6,7 @@ from torch.nn import functional as F
 
 from .models import register_meta_arch, make_backbone, make_neck, make_generator
 from .blocks import MaskedConv1D, Scale, LayerNorm, DeepInterpolator
-from .losses import ctr_diou_loss_1d, sigmoid_focal_loss
+from .losses import ctr_diou_loss_1d, ctr_iou_1d, sigmoid_focal_loss, supcon_loss
 
 from ..utils import batched_nms
 
@@ -158,6 +158,122 @@ class PtTransformerRegHead(nn.Module):
         # fpn_masks remains the same
         return out_offsets
 
+class PtTransformerDFLHead(nn.Module):
+    """
+    Distributional regression head for left/right offsets.
+    """
+    def __init__(
+        self,
+        input_dim,
+        feat_dim,
+        fpn_levels,
+        dfl_bin=16,
+        num_layers=3,
+        kernel_size=3,
+        act_layer=nn.ReLU,
+        with_ln=False
+    ):
+        super().__init__()
+        self.fpn_levels = fpn_levels
+        self.dfl_bin = dfl_bin
+        self.act = act_layer()
+
+        self.head = nn.ModuleList()
+        self.norm = nn.ModuleList()
+        for idx in range(num_layers - 1):
+            in_dim = input_dim if idx == 0 else feat_dim
+            out_dim = feat_dim
+            self.head.append(
+                MaskedConv1D(
+                    in_dim, out_dim, kernel_size,
+                    stride=1, padding=kernel_size // 2, bias=(not with_ln)
+                )
+            )
+            self.norm.append(LayerNorm(out_dim) if with_ln else nn.Identity())
+
+        self.offset_head = MaskedConv1D(
+            feat_dim, 2 * dfl_bin, kernel_size,
+            stride=1, padding=kernel_size // 2
+        )
+
+    def forward(self, fpn_feats, fpn_masks):
+        assert len(fpn_feats) == len(fpn_masks)
+        assert len(fpn_feats) == self.fpn_levels
+
+        out_logits = tuple()
+        for cur_feat, cur_mask in zip(fpn_feats, fpn_masks):
+            cur_out = cur_feat
+            for idx in range(len(self.head)):
+                cur_out, _ = self.head[idx](cur_out, cur_mask)
+                cur_out = self.act(self.norm[idx](cur_out))
+            cur_logits, _ = self.offset_head(cur_out, cur_mask)
+            out_logits += (cur_logits, )
+        return out_logits
+
+
+class PtTransformerQualHead(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        feat_dim,
+        fpn_levels,
+        num_layers=3,
+        kernel_size=3,
+        act_layer=nn.ReLU,
+        with_ln=False
+    ):
+        super().__init__()
+        self.fpn_levels = fpn_levels
+        self.act = act_layer()
+
+        self.head = nn.ModuleList()
+        self.norm = nn.ModuleList()
+        for idx in range(num_layers - 1):
+            in_dim = input_dim if idx == 0 else feat_dim
+            out_dim = feat_dim
+            self.head.append(
+                MaskedConv1D(
+                    in_dim, out_dim, kernel_size,
+                    stride=1, padding=kernel_size // 2, bias=(not with_ln)
+                )
+            )
+            self.norm.append(LayerNorm(out_dim) if with_ln else nn.Identity())
+
+        self.qual_head = MaskedConv1D(
+            feat_dim, 1, kernel_size,
+            stride=1, padding=kernel_size // 2
+        )
+
+    def forward(self, fpn_feats, fpn_masks):
+        assert len(fpn_feats) == len(fpn_masks)
+        assert len(fpn_feats) == self.fpn_levels
+
+        out_logits = tuple()
+        for cur_feat, cur_mask in zip(fpn_feats, fpn_masks):
+            cur_out = cur_feat
+            for idx in range(len(self.head)):
+                cur_out, _ = self.head[idx](cur_out, cur_mask)
+                cur_out = self.act(self.norm[idx](cur_out))
+            cur_logits, _ = self.qual_head(cur_out, cur_mask)
+            out_logits += (cur_logits, )
+        return out_logits
+
+
+class GateHead(nn.Module):
+    def __init__(self, input_dim, feat_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, feat_dim)
+        self.act = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(feat_dim, 1)
+
+    def forward(self, fpn_feats, fpn_masks):
+        pooled = []
+        for feat, mask in zip(fpn_feats, fpn_masks):
+            mask = mask.to(feat.dtype)
+            denom = mask.sum(dim=-1).clamp(min=1.0)
+            pooled.append((feat * mask).sum(dim=-1) / denom)
+        feat = torch.stack(pooled, dim=0).mean(dim=0)
+        return self.fc2(self.act(self.fc1(feat)))
 
 @register_meta_arch("AVLocPointTransformerRecoveryNoNorm")
 class AVPtTransformerRecovery(nn.Module):
@@ -193,6 +309,18 @@ class AVPtTransformerRecovery(nn.Module):
         train_cfg,             # other cfg for training
         test_cfg,               # other cfg for testing
         mlp_ratio=None, #
+        tfaa_on=True,
+        pca_on=True,
+        refine_on=False,
+        refine_w=0.0,
+        refine_start=0,
+        pre_w=0.0,
+        dfl_on=False,
+        dfl_w=0.0,
+        dfl_bin=16,
+        qual_on=False,
+        gate_on=False,
+        gate_dim=256,
     ):
         super().__init__()
         input_dim = input_dim+audio_input_dim
@@ -223,12 +351,30 @@ class AVPtTransformerRecovery(nn.Module):
         self.max_div_factor = max_div_factor
         
         self.mlp_ratio=mlp_ratio
+        self.tfaa_on = tfaa_on
+        self.pca_on = pca_on
+        self.refine_on = refine_on
+        self.refine_w = refine_w
+        self.refine_start = refine_start
+        self.pre_w = pre_w
+        self.dfl_on = dfl_on
+        self.dfl_w = dfl_w
+        self.dfl_bin = dfl_bin
+        self.qual_on = qual_on
+        self.gate_on = gate_on
+        self.gate_dim = gate_dim
+        self.register_buffer('dfl_proj', torch.arange(self.dfl_bin, dtype=torch.float32), persistent=False)
 
         # training time config
         self.train_center_sample = train_cfg['center_sample']
         assert self.train_center_sample in ['radius', 'none']
         self.train_center_sample_radius = train_cfg['center_sample_radius']
         self.train_loss_weight = train_cfg['loss_weight']
+        self.train_con_on = train_cfg.get('con_on', True)
+        self.train_con_w = train_cfg.get('con_w', 0.05)
+        self.train_con_t = train_cfg.get('con_t', 0.7)
+        self.train_qual_w = train_cfg.get('qual_w', 1.0)
+        self.train_gate_w = train_cfg.get('gate_w', 0.1)
         self.train_cls_prior_prob = train_cfg['cls_prior_prob']
         self.train_dropout = train_cfg['dropout']
         self.train_droppath = train_cfg['droppath']
@@ -246,10 +392,16 @@ class AVPtTransformerRecovery(nn.Module):
         self.test_multiclass_nms = test_cfg['multiclass_nms']
         self.test_nms_sigma = test_cfg['nms_sigma']
         self.test_voting_thresh = test_cfg['voting_thresh']
+        self.adapt_nms = test_cfg.get('adapt_nms', False)
+        self.len_thr = test_cfg.get('len_thr', 0.7)
+        self.sigma_s = test_cfg.get('sigma_s', self.test_nms_sigma)
+        self.sigma_l = test_cfg.get('sigma_l', self.test_nms_sigma)
+        self.test_qual_mul = test_cfg.get('qual_mul', True)
+        self.test_gate_mul = test_cfg.get('gate_mul', True)
 
         # we will need a better way to dispatch the params to backbones / necks
         # backbone network: conv + transformer
-        assert backbone_type in ['convHRLRFullResSelfAttTransformerRevised']
+        assert backbone_type in ['convHRLRFullResSelfAttTransformerRevised', 'convHRLRSwin']
         self.backbone = make_backbone(
             backbone_type,
             **{
@@ -266,7 +418,9 @@ class AVPtTransformerRecovery(nn.Module):
                 'proj_pdrop' : self.train_dropout,
                 'path_pdrop' : self.train_droppath,
                 'use_abs_pe' : use_abs_pe,
-                'use_rel_pe' : use_rel_pe
+                'use_rel_pe' : use_rel_pe,
+                'tfaa_on' : self.tfaa_on,
+                'pca_on' : self.pca_on
             }
         )   
 
@@ -306,14 +460,47 @@ class AVPtTransformerRecovery(nn.Module):
             num_layers=head_num_layers,
             empty_cls=train_cfg['head_empty_cls']
         )
-        self.reg_head = PtTransformerRegHead(
-            fpn_dim, head_dim, len(self.fpn_strides),
-            kernel_size=head_kernel_size,
-            num_layers=head_num_layers,
-            with_ln=head_with_ln
-        )
-
-        self.interpolator = DeepInterpolator(input_dim, embd_dim, norm=False)
+        if self.dfl_on:
+            self.reg_head = PtTransformerDFLHead(
+                fpn_dim, head_dim, len(self.fpn_strides),
+                dfl_bin=self.dfl_bin,
+                kernel_size=head_kernel_size,
+                num_layers=head_num_layers,
+                with_ln=head_with_ln
+            )
+        else:
+            self.reg_head = PtTransformerRegHead(
+                fpn_dim, head_dim, len(self.fpn_strides),
+                kernel_size=head_kernel_size,
+                num_layers=head_num_layers,
+                with_ln=head_with_ln
+            )
+        if self.refine_on:
+            self.refine_head = PtTransformerRegHead(
+                fpn_dim, head_dim, len(self.fpn_strides),
+                kernel_size=head_kernel_size,
+                num_layers=head_num_layers,
+                with_ln=head_with_ln
+            )
+        else:
+            self.refine_head = None
+        if self.qual_on:
+            self.qual_head = PtTransformerQualHead(
+                fpn_dim, head_dim, len(self.fpn_strides),
+                kernel_size=head_kernel_size,
+                num_layers=head_num_layers,
+                with_ln=head_with_ln
+            )
+        else:
+            self.qual_head = None
+        if self.gate_on:
+            self.gate_head = GateHead(fpn_dim, self.gate_dim)
+        else:
+            self.gate_head = None
+        if self.tfaa_on:
+            self.interpolator = DeepInterpolator(input_dim, embd_dim, norm=False)
+        else:
+            self.interpolator = None
         
         # maintain an EMA of #foreground to stabilize the loss normalizer
         # useful for small mini-batch training
@@ -333,7 +520,10 @@ class AVPtTransformerRecovery(nn.Module):
         batched_inputs, batched_masks = self.preprocessing(video_list)
 
         # forward the network (backbone -> neck -> heads)
-        norm_inputs,reco_result, cls_scores = self.interpolator(batched_inputs, batched_masks)
+        if self.tfaa_on:
+            norm_inputs, reco_result, cls_scores = self.interpolator(batched_inputs, batched_masks)
+        else:
+            norm_inputs, reco_result, cls_scores = None, None, None
         
         feats, masks = self.backbone(batched_inputs,norm_inputs, reco_result,batched_masks)
         fpn_feats, fpn_masks = self.neck(feats, masks)
@@ -348,12 +538,20 @@ class AVPtTransformerRecovery(nn.Module):
         out_cls_logits = self.cls_head(fpn_feats, fpn_masks)
         # out_offset: List[B, 2, T_i]
         out_offsets = self.reg_head(fpn_feats, fpn_masks)
+        # out_refine: List[B, 2, T_i]
+        out_refines = self.refine_head(fpn_feats, fpn_masks) if self.refine_on else None
+        out_quals = self.qual_head(fpn_feats, fpn_masks) if self.qual_on else None
+        out_gate = self.gate_head(fpn_feats, fpn_masks) if self.gate_on else None
 
         # permute the outputs
         # out_cls: F List[B, #cls, T_i] -> F List[B, T_i, #cls]
         out_cls_logits = [x.permute(0, 2, 1) for x in out_cls_logits]
         # out_offset: F List[B, 2 (xC), T_i] -> F List[B, T_i, 2 (xC)]
         out_offsets = [x.permute(0, 2, 1) for x in out_offsets]
+        if out_refines is not None:
+            out_refines = [x.permute(0, 2, 1) for x in out_refines]
+        if out_quals is not None:
+            out_quals = [x.permute(0, 2, 1) for x in out_quals]
         # fpn_masks: F list[B, 1, T_i] -> F List[B, T_i]
         fpn_masks = [x.squeeze(1) for x in fpn_masks]
 
@@ -379,8 +577,8 @@ class AVPtTransformerRecovery(nn.Module):
 
             # compute the loss and return
             losses = self.losses(
-                fpn_masks,
-                out_cls_logits, out_offsets,
+                fpn_feats, fpn_masks,
+                out_cls_logits, out_offsets, out_refines, out_quals, out_gate,
                 norm_inputs,reco_result, cls_scores,
                 gt_cls_labels, gt_offsets,gt_video_labels,vaild_idx
             )
@@ -390,9 +588,30 @@ class AVPtTransformerRecovery(nn.Module):
             # decode the actions (sigmoid / stride, etc)
             results = self.inference(
                 video_list, points, fpn_masks,
-                out_cls_logits, out_offsets
+                out_cls_logits, out_offsets, out_refines, out_quals, out_gate
             )
             return results
+
+    def decode_dfl(self, pred_logits):
+        # pred_logits: [N, 2, K]
+        prob = F.softmax(pred_logits, dim=-1)
+        return (prob * self.dfl_proj.view(1, 1, -1)).sum(-1)
+
+    def loss_dfl(self, pred_logits, target_offsets):
+        # pred_logits: [N, 2, K], target_offsets: [N, 2]
+        target = target_offsets.clamp(min=0.0, max=self.dfl_bin - 1 - 1e-4)
+        left = target.floor().long()
+        right = (left + 1).clamp(max=self.dfl_bin - 1)
+        w_left = right.float() - target
+        w_right = target - left.float()
+
+        loss = pred_logits.new_tensor(0.0)
+        for s in range(2):
+            logit_s = pred_logits[:, s, :]
+            ce_left = F.cross_entropy(logit_s, left[:, s], reduction='none')
+            ce_right = F.cross_entropy(logit_s, right[:, s], reduction='none')
+            loss = loss + (ce_left * w_left[:, s] + ce_right * w_right[:, s]).sum()
+        return loss
 
     @torch.no_grad()
     def preprocessing(self, video_list, padding_val=0.0):
@@ -413,7 +632,6 @@ class AVPtTransformerRecovery(nn.Module):
             for feat, pad_feat in zip(feats, batched_inputs):
                 pad_feat[..., :feat.shape[-1]].copy_(feat)
         else:
-            assert len(video_list) == 1, "Only support batch_size = 1 during inference"
             # input length < self.max_seq_len, pad to max_seq_len
             if max_len <= self.max_seq_len:
                 max_len = self.max_seq_len
@@ -421,9 +639,10 @@ class AVPtTransformerRecovery(nn.Module):
                 # pad the input to the next divisible size
                 stride = self.max_div_factor
                 max_len = (max_len + (stride - 1)) // stride * stride
-            padding_size = [0, max_len - feats_lens[0]]
-            batched_inputs = F.pad(
-                feats[0], padding_size, value=padding_val).unsqueeze(0)
+            batch_shape = [len(feats), feats[0].shape[0], max_len]
+            batched_inputs = feats[0].new_full(batch_shape, padding_val)
+            for feat, pad_feat in zip(feats, batched_inputs):
+                pad_feat[..., :feat.shape[-1]].copy_(feat)
 
         # generate the mask
         batched_masks = torch.arange(max_len)[None, :] < feats_lens[:, None]
@@ -540,8 +759,8 @@ class AVPtTransformerRecovery(nn.Module):
         return cls_targets, reg_targets
 
     def losses(
-        self, fpn_masks,
-        out_cls_logits, out_offsets,
+        self, fpn_feats, fpn_masks,
+        out_cls_logits, out_offsets, out_refines, out_quals, out_gate,
         norm_inputs,reco_result, cls_scores,
         gt_cls_labels, gt_offsets,gt_video_labels,vaild_idx
     ):
@@ -557,7 +776,17 @@ class AVPtTransformerRecovery(nn.Module):
         pos_mask = torch.logical_and((gt_cls.sum(-1) > 0), valid_mask)
 
         # cat the predicted offsets -> (B, FT, 2 (xC)) -> # (#Pos, 2 (xC))
-        pred_offsets = torch.cat(out_offsets, dim=1)[vaild_idx][pos_mask]
+        if self.dfl_on:
+            pred_dfl = torch.cat(out_offsets, dim=1)[vaild_idx]
+            pred_dfl_pos = pred_dfl[pos_mask].view(-1, 2, self.dfl_bin)
+            pred_offsets = self.decode_dfl(pred_dfl_pos)
+        else:
+            pred_offsets = torch.cat(out_offsets, dim=1)[vaild_idx][pos_mask]
+        if out_refines is not None:
+            pred_refines = torch.cat(out_refines, dim=1)[vaild_idx][pos_mask]
+            pred_offsets_ref = F.relu(pred_offsets + pred_refines)
+        else:
+            pred_offsets_ref = None
         gt_offsets = torch.stack(gt_offsets)[pos_mask]
 
         # update the loss normalizer
@@ -584,6 +813,9 @@ class AVPtTransformerRecovery(nn.Module):
         # 2. regression using IoU/GIoU loss (defined on positive samples)
         if num_pos == 0:
             reg_loss = 0 * pred_offsets.sum()
+            refine_loss = 0 * pred_offsets.sum()
+            dfl_loss = 0 * pred_offsets.sum()
+            qual_loss = 0 * pred_offsets.sum()
         else:
             # giou loss defined on positive samples
             reg_loss = ctr_diou_loss_1d(
@@ -592,18 +824,63 @@ class AVPtTransformerRecovery(nn.Module):
                 reduction='sum'
             )
             reg_loss /= self.loss_normalizer
+            if pred_offsets_ref is not None:
+                refine_loss = ctr_diou_loss_1d(
+                    pred_offsets_ref,
+                    gt_offsets,
+                    reduction='sum'
+                )
+                refine_loss /= self.loss_normalizer
+            else:
+                refine_loss = reg_loss * 0.0
+            if self.dfl_on:
+                dfl_loss = self.loss_dfl(pred_dfl_pos, gt_offsets)
+                dfl_loss /= self.loss_normalizer
+            else:
+                dfl_loss = reg_loss * 0.0
+            if out_quals is not None:
+                qual_logits = torch.cat(out_quals, dim=1)[vaild_idx][pos_mask].squeeze(-1)
+                with torch.no_grad():
+                    if pred_offsets_ref is not None:
+                        qual_tgt = ctr_iou_1d(pred_offsets_ref.detach(), gt_offsets)
+                    else:
+                        qual_tgt = ctr_iou_1d(pred_offsets.detach(), gt_offsets)
+                qual_loss = F.binary_cross_entropy_with_logits(
+                    qual_logits, qual_tgt, reduction='sum'
+                )
+                qual_loss /= self.loss_normalizer
+            else:
+                qual_loss = reg_loss * 0.0
 
         
-        gt_video_labels = torch.stack(gt_video_labels)
-        real_index = torch.where(1 - gt_video_labels)[0]
-        norm_inputs = torch.index_select(norm_inputs, dim=0, index=real_index)
-        reco_result = torch.index_select(reco_result, dim=0, index=real_index)
-        reco_loss = torch.mean(torch.abs(reco_result - norm_inputs))
-        reco_cls_loss = sigmoid_focal_loss(
-            cls_scores,
-            gt_video_labels,
-            reduction='sum'
-        )
+        if self.tfaa_on and (norm_inputs is not None) and (reco_result is not None) and (cls_scores is not None):
+            gt_video_labels = torch.stack(gt_video_labels)
+            real_index = torch.where(1 - gt_video_labels)[0]
+            if real_index.numel() > 0:
+                cur_norm_inputs = torch.index_select(norm_inputs, dim=0, index=real_index)
+                cur_reco_result = torch.index_select(reco_result, dim=0, index=real_index)
+                reco_loss = torch.mean(torch.abs(cur_reco_result - cur_norm_inputs))
+            else:
+                reco_loss = cls_loss * 0.0
+            reco_cls_loss = sigmoid_focal_loss(
+                cls_scores,
+                gt_video_labels,
+                reduction='sum'
+            )
+        else:
+            reco_loss = cls_loss * 0.0
+            reco_cls_loss = cls_loss * 0.0
+
+        if out_gate is not None:
+            gate_tgt = torch.stack(gt_video_labels).float()
+            gate_loss = sigmoid_focal_loss(
+                out_gate,
+                gate_tgt,
+                reduction='sum'
+            )
+            gate_loss /= max(out_gate.shape[0], 1)
+        else:
+            gate_loss = cls_loss * 0.0
         
         if self.train_loss_weight > 0:
             loss_weight = self.train_loss_weight
@@ -611,11 +888,24 @@ class AVPtTransformerRecovery(nn.Module):
             loss_weight = cls_loss.detach() / max(reg_loss.item(), 0.01)
 
         # return a dict of losses
-        final_loss = cls_loss + reg_loss * loss_weight + reco_loss + 0.1*reco_cls_loss
+        if self.train_con_on:
+            feats0 = fpn_feats[0].permute(0, 2, 1)[vaild_idx]
+            mask0 = fpn_masks[0][vaild_idx]
+            gt_cls0 = torch.stack(gt_cls_labels)[:, :mask0.shape[1], :]
+            frame_lab = (gt_cls0.sum(-1) > 0).long()
+            con_loss = supcon_loss(feats0, frame_lab, mask0, self.train_con_t)
+        else:
+            con_loss = cls_loss * 0.0
+        final_loss = cls_loss + reg_loss * loss_weight + self.refine_w * refine_loss + self.dfl_w * dfl_loss + self.train_qual_w * qual_loss + self.train_gate_w * gate_loss + reco_loss + 0.1*reco_cls_loss + self.train_con_w * con_loss
         return {'cls_loss'   : cls_loss,
                 'reg_loss'   : reg_loss,
+                'refine_loss': refine_loss,
+                'dfl_loss'   : dfl_loss,
+                'qual_loss'  : qual_loss,
+                'gate_loss'  : gate_loss,
                 'reco_loss'  : reco_loss,
                 'reco_cls_loss': reco_cls_loss,
+                'con_loss'   : con_loss,
                 'final_loss' : final_loss}
 
     @torch.no_grad()
@@ -623,7 +913,7 @@ class AVPtTransformerRecovery(nn.Module):
         self,
         video_list,
         points, fpn_masks,
-        out_cls_logits, out_offsets
+        out_cls_logits, out_offsets, out_refines, out_quals, out_gate
     ):
         # video_list B (list) [dict]
         # points F (list) [T_i, 4]
@@ -645,12 +935,24 @@ class AVPtTransformerRecovery(nn.Module):
             # gather per-video outputs
             cls_logits_per_vid = [x[idx] for x in out_cls_logits]
             offsets_per_vid = [x[idx] for x in out_offsets]
+            if out_refines is not None:
+                refines_per_vid = [x[idx] for x in out_refines]
+            else:
+                refines_per_vid = None
+            if out_quals is not None:
+                quals_per_vid = [x[idx] for x in out_quals]
+            else:
+                quals_per_vid = None
             fpn_masks_per_vid = [x[idx] for x in fpn_masks]
             # inference on a single video (should always be the case)
             results_per_vid = self.inference_single_video(
                 points, fpn_masks_per_vid,
-                cls_logits_per_vid, offsets_per_vid
+                cls_logits_per_vid, offsets_per_vid, refines_per_vid, quals_per_vid
             )
+            if out_gate is not None:
+                results_per_vid['vid_score'] = out_gate[idx].sigmoid().view(())
+            else:
+                results_per_vid['vid_score'] = results_per_vid['scores'].new_tensor(1.0)
             # pass through video meta info
             results_per_vid['video_id'] = vidx
             results_per_vid['fps'] = fps
@@ -671,6 +973,8 @@ class AVPtTransformerRecovery(nn.Module):
         fpn_masks,
         out_cls_logits,
         out_offsets,
+        out_refines=None,
+        out_quals=None,
     ):
         # points F (list) [T_i, 4]
         # fpn_masks, out_*: F (List) [T_i, C]
@@ -679,11 +983,18 @@ class AVPtTransformerRecovery(nn.Module):
         cls_idxs_all = []
 
         # loop over fpn levels
-        for cls_i, offsets_i, pts_i, mask_i in zip(
-                out_cls_logits, out_offsets, points, fpn_masks
+        for lvl, (cls_i, offsets_i, pts_i, mask_i) in enumerate(
+                zip(out_cls_logits, out_offsets, points, fpn_masks)
             ):
+            if self.dfl_on:
+                offsets_i = self.decode_dfl(offsets_i.view(-1, 2, self.dfl_bin)).view(-1, 2)
+            if out_refines is not None:
+                offsets_i = F.relu(offsets_i + out_refines[lvl])
             # sigmoid normalization for output logits
             pred_prob = (cls_i.sigmoid() * mask_i.unsqueeze(-1)).flatten()
+            if (out_quals is not None) and self.test_qual_mul:
+                qual_i = (out_quals[lvl].sigmoid() * mask_i.unsqueeze(-1)).flatten()
+                pred_prob = pred_prob * qual_i
 
             # Apply filtering to make NMS faster following detectron2
             # 1. Keep seg with confidence score > a threshold
@@ -747,18 +1058,54 @@ class AVPtTransformerRecovery(nn.Module):
             segs = results_per_vid['segments'].detach().cpu()
             scores = results_per_vid['scores'].detach().cpu()
             labels = results_per_vid['labels'].detach().cpu()
+            if self.gate_on and self.test_gate_mul:
+                scores = scores * float(results_per_vid.get('vid_score', 1.0))
             if self.test_nms_method != 'none':
+                use_soft = (self.test_nms_method == 'soft')
+
+                def run_nms(cur_segs, cur_scores, cur_labels, cur_sigma):
+                    return batched_nms(
+                        cur_segs, cur_scores, cur_labels,
+                        self.test_iou_threshold,
+                        self.test_min_score,
+                        self.test_max_seg_num,
+                        use_soft_nms=use_soft,
+                        multiclass=self.test_multiclass_nms,
+                        sigma=cur_sigma,
+                        voting_thresh=self.test_voting_thresh
+                    )
+
                 # 2: batched nms (only implemented on CPU)
-                segs, scores, labels = batched_nms(
-                    segs, scores, labels,
-                    self.test_iou_threshold,
-                    self.test_min_score,
-                    self.test_max_seg_num,
-                    use_soft_nms = (self.test_nms_method == 'soft'),
-                    multiclass = self.test_multiclass_nms,
-                    sigma = self.test_nms_sigma,
-                    voting_thresh = self.test_voting_thresh
-                )
+                if use_soft and self.adapt_nms and segs.numel() > 0:
+                    seg_len = (segs[:, 1] - segs[:, 0]) * stride / max(fps, 1e-6)
+                    short_m = seg_len <= self.len_thr
+                    long_m = torch.logical_not(short_m)
+                    out = []
+                    if short_m.any():
+                        out.append(run_nms(
+                            segs[short_m], scores[short_m], labels[short_m], self.sigma_s
+                        ))
+                    if long_m.any():
+                        out.append(run_nms(
+                            segs[long_m], scores[long_m], labels[long_m], self.sigma_l
+                        ))
+                    if len(out) > 0:
+                        segs = torch.cat([x[0] for x in out], dim=0)
+                        scores = torch.cat([x[1] for x in out], dim=0)
+                        labels = torch.cat([x[2] for x in out], dim=0)
+                        if segs.shape[0] > self.test_max_seg_num:
+                            idx = torch.argsort(scores, descending=True)[:self.test_max_seg_num]
+                            segs = segs[idx]
+                            scores = scores[idx]
+                            labels = labels[idx]
+                    else:
+                        segs = segs.new_zeros((0, 2))
+                        scores = scores.new_zeros((0,))
+                        labels = labels.new_zeros((0,), dtype=labels.dtype)
+                else:
+                    segs, scores, labels = run_nms(
+                        segs, scores, labels, self.test_nms_sigma
+                    )
             # 3: convert from feature grids to seconds
             if segs.shape[0] > 0:
                 segs = (segs * stride + 0.5 * nframes) / fps

@@ -116,3 +116,41 @@ def ctr_diou_loss_1d(
 
     return loss
 
+
+@torch.jit.script
+def ctr_iou_1d(
+    input_offsets: torch.Tensor,
+    target_offsets: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    input_offsets = input_offsets.float()
+    target_offsets = target_offsets.float()
+
+    lp, rp = input_offsets[:, 0], input_offsets[:, 1]
+    lg, rg = target_offsets[:, 0], target_offsets[:, 1]
+
+    lkis = torch.min(lp, lg)
+    rkis = torch.min(rp, rg)
+    intsctk = rkis + lkis
+    unionk = (lp + rp) + (lg + rg) - intsctk
+    return intsctk / unionk.clamp(min=eps)
+
+
+def supcon_loss(feats: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, temp: float) -> torch.Tensor:
+    # contrastive loss
+    feats = feats[mask]
+    labels = labels[mask]
+    if feats.numel() == 0 or feats.shape[0] < 2:
+        return 0.0 * feats.sum()
+    feats = F.normalize(feats.float(), dim=1)
+    sim = feats @ feats.t() / temp
+    eye = torch.eye(sim.shape[0], device=sim.device, dtype=torch.bool)
+    sim = sim - sim.max(dim=1, keepdim=True).values
+    exp = torch.exp(sim) * (~eye)
+    log_prob = sim - torch.log(exp.sum(dim=1, keepdim=True) + 1e-8)
+    pos = labels[:, None].eq(labels[None, :]) & (~eye)
+    pos_cnt = pos.sum(dim=1)
+    if (pos_cnt > 0).sum() == 0:
+        return 0.0 * feats.sum()
+    mean_log = (pos * log_prob).sum(dim=1) / pos_cnt.clamp(min=1)
+    return -mean_log[pos_cnt > 0].mean()

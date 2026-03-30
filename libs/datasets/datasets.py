@@ -24,6 +24,7 @@ def make_data_loader(dataset, is_training, generator, batch_size, num_workers):
         dataset,
         batch_size=batch_size,
         num_workers=num_workers,
+        pin_memory=True,
         collate_fn=trivial_batch_collator,
         worker_init_fn=(worker_init_reset_seed if is_training else None),
         shuffle=is_training,

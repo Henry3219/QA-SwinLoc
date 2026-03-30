@@ -74,7 +74,6 @@ def main(args):
     
     #eval
     det_eval, output_file = None, None
-    bestmAP = 0
     if args.eval:
         val_dataset = make_dataset(
             cfg['dataset_name'], False, cfg['val_split'], **cfg['dataset']
@@ -94,8 +93,12 @@ def main(args):
     """3. create model, optimizer, and scheduler"""
     # model
     model = make_meta_arch(cfg['model_name'], **cfg['model'])
-    # not ideal for multi GPU training, ok for now
-    model = nn.DataParallel(model, device_ids=cfg['devices'])
+    if len(cfg['devices']) > 1:
+        model = nn.DataParallel(model, device_ids=cfg['devices'])
+    else:
+        model = model.to(cfg['devices'][0])
+    use_amp = torch.cuda.is_available()
+    amp_scale = torch.cuda.amp.GradScaler(enabled=use_amp)
     # optimizer
     optimizer = make_optimizer(model, cfg['opt'])
     # schedule
@@ -103,8 +106,9 @@ def main(args):
     scheduler = make_scheduler(optimizer, cfg['opt'], num_iters_per_epoch)
 
     # enable model EMA
-    print("Using model EMA ...")
-    model_ema = ModelEma(model)
+    use_ema = cfg['train_cfg'].get('use_ema', True)
+    model_ema = ModelEma(model) if use_ema else None
+    print("Using model EMA ... {}".format(use_ema))
 
     """4. Resume from model / Misc"""
     # resume from a checkpoint?
@@ -116,7 +120,10 @@ def main(args):
                     cfg['devices'][0]))
             args.start_epoch = checkpoint['epoch']
             model.load_state_dict(checkpoint['state_dict'])
-            model_ema.module.load_state_dict(checkpoint['state_dict_ema'])
+            if (model_ema is not None) and ('state_dict_ema' in checkpoint):
+                model_ema.module.load_state_dict(checkpoint['state_dict_ema'])
+            elif model_ema is not None:
+                model_ema.module.load_state_dict(checkpoint['state_dict'])
             # also load the optimizer / scheduler if necessary
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
@@ -151,49 +158,50 @@ def main(args):
             epoch,
             model_ema = model_ema,
             clip_grad_l2norm = cfg['train_cfg']['clip_grad_l2norm'],
+            use_amp = use_amp,
+            amp_scale = amp_scale,
             tb_writer=tb_writer,
-            print_freq=args.print_freq
+            print_freq=args.print_freq,
+            refine_on=cfg['model'].get('refine_on', False),
+            refine_start=cfg['model'].get('refine_start', 0),
+            pre_w=cfg['model'].get('pre_w', 0.0),
+            refine_w=cfg['model'].get('refine_w', 0.0),
         )
 
-        # save ckpt once in a while
-        if (
-            ((epoch + 1) == max_epochs) or
-            ((args.ckpt_freq > 0) and ((epoch + 1) % args.ckpt_freq == 0))
-        ):
-
-            mAP=0.0
-            if (output_file is not None) or (det_eval is not None):
-                mAP = valid_one_epoch(
-                    val_loader,
-                    model,
-                    -1,
-                    evaluator=det_eval,
-                    output_file=output_file,
-                    ext_score_file=None,
-                    tb_writer=tb_writer,
-                    print_freq=args.print_freq,
-                    gt_file=val_dataset.json_file,
-                    subset=val_dataset.split[0],
-                    tiou_thre=val_db_vars['tiou_thresholds'],
-                    max_avg_nr_proposal=cfg['model']['test_cfg']['max_seg_num'],
-                    dataset_name=cfg['dataset_name']
-                )
-
-            save_states = {
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'optimizer': optimizer.state_dict(),
-            }
-
-            save_states['state_dict_ema'] = model_ema.module.state_dict()
-            save_checkpoint(
-                save_states,
-                mAP>bestmAP,
-                file_folder=ckpt_folder,
-                file_name='epoch_{:03d}.pth.tar'.format(epoch + 1)
+        if (output_file is not None) or (det_eval is not None):
+            valid_one_epoch(
+                val_loader,
+                model,
+                -1,
+                evaluator=det_eval,
+                output_file=output_file,
+                ext_score_file=None,
+                tb_writer=tb_writer,
+                print_freq=args.print_freq,
+                gt_file=val_dataset.json_file,
+                subset=val_dataset.split[0],
+                tiou_thre=val_db_vars['tiou_thresholds'],
+                max_avg_nr_proposal=cfg['model']['test_cfg']['max_seg_num'],
+                topk_out=cfg['model']['test_cfg'].get('export_topk', 100),
+                eval_jobs=cfg['model']['test_cfg'].get('eval_jobs', 16),
+                dataset_name=cfg['dataset_name']
             )
-            bestmAP=max(mAP,bestmAP)
+
+        save_states = {
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'optimizer': optimizer.state_dict(),
+        }
+
+        if model_ema is not None:
+            save_states['state_dict_ema'] = model_ema.module.state_dict()
+        save_checkpoint(
+            save_states,
+            False,
+            file_folder=ckpt_folder,
+            file_name='last.pth.tar'
+        )
             
                 
             
@@ -214,7 +222,7 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--print-freq', default=10, type=int,
                         help='print frequency (default: 10 iterations)')
     parser.add_argument('-c', '--ckpt-freq', default=15, type=int,
-                        help='checkpoint frequency (default: every 5 epochs)')
+                        help='deprecated, ignored (kept for backward compatibility)')
     parser.add_argument('--output', default='', type=str,
                         help='name of exp folder (default: none)')
     parser.add_argument('--resume', default='', type=str, metavar='PATH',

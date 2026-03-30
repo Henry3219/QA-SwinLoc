@@ -1,0 +1,114 @@
+dataset_name: lavdfv2
+train_split: ['train']
+val_split: ['dev'] #dev
+test_split: ['test']
+data_mode: full
+audio_mode: byola #wav2vec
+data_map: {
+  full: {
+    json_file: /input0/Backup/features/LAV-DF-UMM/annotations/metadata.json,
+    feat_folder: /input0/Backup/features/LAV-DF-UMM/feats/tsn,
+  },
+  subset: {
+    json_file: /input0/Backup/features/lavdf_subset/annotations/metadata_subset.json,
+    feat_folder: /input0/Backup/features/lavdf_subset/feats/tsn,
+  },
+}
+audio_map: {
+  byola: {
+    full: /input0/Backup/features/LAV-DF-UMM/feats/byola,
+    subset: /input0/Backup/features/lavdf_subset/feats/byola,
+    audio_input_dim: 2048,
+  },
+  wav2vec: {
+    full: /input0/Backup/features/LAV-DF-UMM/feats/wav2vec,
+    subset: /input0/Backup/features/lavdf_subset/feats/wav2vec,
+    audio_input_dim: 768,
+  },
+}
+dataset: {
+  json_file: ./data/lavdf/annotations/metadata.json,
+  feat_folder: ./data/lavdf/feats/tsn,
+  file_prefix: ['rgb', 'flow'],
+  file_ext: .npy,
+  audio_feat_folder: ./data/lavdf/feats/byola,
+  audio_file_ext: .npy,
+  num_classes: 1,
+  input_dim: 4096,
+  audio_input_dim: 2048,
+  feat_stride: 1,
+  num_frames: 1,
+  trunc_thresh: 0.5,
+  crop_ratio: [0.9, 1.0],
+  max_seq_len: 576,
+  force_upsampling: True,
+}
+
+model_name: AVLocPointTransformerRecoveryNoNorm
+model: {
+  backbone_type: convHRLRSwin,
+  fpn_type: fpn,
+  max_buffer_len_factor: 1.0,
+  n_mha_win_size: [7, 7, 7, 7, 7, -1],
+  n_head: 4,
+  embd_dim: 256,
+  fpn_dim: 256,
+  head_dim: 256,
+  use_abs_pe: True,
+  tfaa_on: False,
+  pca_on: False,
+  refine_on: False,
+  refine_w: 1.0,
+  refine_start: 0,
+  pre_w: 0.0,
+  dfl_on: False,
+  dfl_w: 0.25,
+  dfl_bin: 16,
+  qual_on: True,
+  gate_on: False,
+  gate_dim: 256,
+}
+opt: {
+  learning_rate: 0.001,
+  epochs: 10,
+  weight_decay: 0.05,
+}
+loader: {
+  batch_size: 32,
+  num_workers: 20,
+}
+train_cfg: {
+  init_loss_norm: 200,
+  clip_grad_l2norm: 1.0,
+  cls_prior_prob: 0.01,
+  center_sample: radius,
+  center_sample_radius: 1.5,
+  label_smoothing: 0.1,
+  use_ema: False,
+  droppath: 0.1,
+  loss_weight: 2.0,
+  con_on: False,
+  con_w: 0.05,
+  con_t: 0.7,
+  qual_w: 1.0,
+  gate_w: 0.1,
+}
+
+test_cfg: {
+  voting_thresh: 0.95,
+  pre_nms_topk: 2000,
+  max_seg_num: 200,
+  export_topk: 100,
+  min_score: 0.003,
+  multiclass_nms: False,
+  nms_sigma: 0.75,
+  adapt_nms: False,
+  len_thr: 0.7,
+  sigma_s: 0.75,
+  sigma_l: 0.75,
+  eval_jobs: 4,
+  qual_mul: True,
+  gate_mul: True,
+  duration_thresh: 0.001,
+}
+output_folder: ./paper_results/

@@ -1,40 +1,50 @@
-dataset_name: lavdfv2
+dataset_name: av1m
 train_split: ['train']
-val_split: ['dev']
+val_split: []
 test_split: ['test']
+
 dataset: {
-  json_file: ./data/lavdf/annotations/metadata.json,
-  feat_folder: ./data/lavdf/feats/tsn,
-  file_prefix: ['rgb','flow'],
+  json_file: ./data/AV-Deepfake1M/annatations/tiny,
+  feat_folder: /input0/Backup/features/AV-Deepfake1M-UMM/tsn,
+  file_prefix: ['rgb', 'flow'],
   file_ext: .npy,
-  audio_feat_folder: ./data/lavdf/feats/byola,
+  audio_feat_folder: /input0/Backup/features/AV-Deepfake1M-UMM/byola_t,
   audio_file_ext: .npy,
   num_classes: 1,
   input_dim: 4096,
   audio_input_dim: 2048,
   feat_stride: 1,
   num_frames: 1,
-  # default_fps: 15,
   trunc_thresh: 0.5,
   crop_ratio: [0.9, 1.0],
-  # upsample the features to a fixed length of 768
-  max_seq_len: 768,
+  max_seq_len: 576,
   force_upsampling: True,
+  audio_sr: 16000,
 }
 
 model_name: AVLocPointTransformerRecoveryNoNorm
 model: {
-  backbone_type: convHRLRFullResSelfAttTransformerRevised,
+  backbone_type: convHRLRSwin,
   fpn_type: fpn,
   max_buffer_len_factor: 1.0,
-  # 192 - 96 - 48 - 24 - 12 - 6
   n_mha_win_size: [7, 7, 7, 7, 7, -1],
-  # shrink the model for reduced input feature channels
   n_head: 4,
   embd_dim: 256,
   fpn_dim: 256,
   head_dim: 256,
   use_abs_pe: True,
+  tfaa_on: False,
+  pca_on: False,
+  refine_on: False,
+  refine_w: 1.0,
+  refine_start: 0,
+  pre_w: 0.0,
+  dfl_on: True,
+  dfl_w: 0.5,
+  dfl_bin: 16,
+  qual_on: True,
+  gate_on: False,
+  gate_dim: 256,
 }
 opt: {
   learning_rate: 0.001,
@@ -42,7 +52,8 @@ opt: {
   weight_decay: 0.05,
 }
 loader: {
-  batch_size: 32,
+  batch_size: 8,
+  num_workers: 4,
 }
 train_cfg: {
   init_loss_norm: 200,
@@ -51,21 +62,31 @@ train_cfg: {
   center_sample: radius,
   center_sample_radius: 1.5,
   label_smoothing: 0.1,
+  use_ema: False,
   droppath: 0.1,
   loss_weight: 2.0,
+  con_on: False,
+  con_w: 0.05,
+  con_t: 0.7,
+  qual_w: 0.5,
+  gate_w: 0.1,
 }
 
-# similar to THUMOS
 test_cfg: {
-  voting_thresh: 0.9,
-  pre_nms_topk: 2000,
-  # max of 100 predictions per video
-  max_seg_num: 100,
+  voting_thresh: 0.95,
+  pre_nms_topk: 1000,
+  max_seg_num: 200,
+  export_topk: 100,
   min_score: 0.001,
-  # score fusion
   multiclass_nms: False,
-  nms_sigma : 0.75,
-  # ext_score_file: None,
+  nms_sigma: 0.50,
+  adapt_nms: False,
+  len_thr: 0.7,
+  sigma_s: 0.75,
+  sigma_l: 0.75,
+  eval_jobs: 4,
+  qual_mul: True,
+  gate_mul: True,
   duration_thresh: 0.001,
 }
 output_folder: ./paper_results/

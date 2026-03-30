@@ -97,7 +97,7 @@ def evaluation_detection(gt_filename,pred_filename,tious,subset):
     return np.mean(anet_detection.mAP)*100
 
 
-def detection_thread(vid,pred_data,cls_data_cls):
+def detection_thread(vid,pred_data,cls_data_cls,topk_out):
     proposal_list = []
     old_df = pred_data[pred_data.video_name == vid]
     # print(df)
@@ -107,7 +107,11 @@ def detection_thread(vid,pred_data,cls_data_cls):
     df['xmin'] = old_df.xmin.values[:]
     df['xmax'] = old_df.xmax.values[:]
     best_score=np.max(cls_data_cls[vid])
-    for j in range(min(100, len(df))):
+    if topk_out is None or topk_out <= 0:
+        max_n = len(df)
+    else:
+        max_n = min(int(topk_out), len(df))
+    for j in range(max_n):
             tmp_proposal = {}
             tmp_proposal["label"] = 'Fake'
             tmp_proposal["score"] = float(df.score.values[j])*best_score
@@ -116,7 +120,7 @@ def detection_thread(vid,pred_data,cls_data_cls):
             proposal_list.append(tmp_proposal)
     return {vid: proposal_list}
 
-def post_process_multi(pred_data,output_file,cls_score_file=None):
+def post_process_multi(pred_data,output_file,cls_score_file=None,topk_out=100,eval_jobs=16):
     
     pred_videos = list(pred_data.video_name.values[:])
     pred_videos = set(pred_videos)
@@ -132,8 +136,12 @@ def post_process_multi(pred_data,output_file,cls_score_file=None):
             if vid in pred_videos:
                 cls_data_cls[vid] = [1,1]        
 
-    parallel = Parallel(n_jobs=16, prefer="processes")
-    detection = parallel(delayed(detection_thread)(vid, pred_data,cls_data_cls)
+    if eval_jobs is None or int(eval_jobs) <= 0:
+        jobs = 16
+    else:
+        jobs = int(eval_jobs)
+    parallel = Parallel(n_jobs=jobs, prefer="processes")
+    detection = parallel(delayed(detection_thread)(vid, pred_data,cls_data_cls,topk_out)
                         for vid in pred_videos)
     detection_dict = {}
     [detection_dict.update(d) for d in detection]
@@ -146,7 +154,8 @@ def post_process_multi(pred_data,output_file,cls_score_file=None):
         
 def run_evaluation(preds, ground_truth_file, proposal_file, dataset_name='',
                    max_avg_nr_proposal=100,
-                   tiou_thre=np.linspace(0.5, 1.0, 11), subset='test',cls_score_file=None):
+                   tiou_thre=np.linspace(0.5, 1.0, 11), subset='test',cls_score_file=None,
+                   topk_out=100, eval_jobs=16):
     preds = pd.DataFrame({
                 'video_name' : preds['video-id'],
                 'xmin' : preds['t-start'].tolist(),
@@ -155,7 +164,7 @@ def run_evaluation(preds, ground_truth_file, proposal_file, dataset_name='',
                 'score': preds['score'].tolist()
             })
     print("saving detection results...")
-    post_process_multi(preds,proposal_file,cls_score_file)
+    post_process_multi(preds,proposal_file,cls_score_file,topk_out,eval_jobs)
     print("evaluion detection results...")
     mAP=evaluation_detection(ground_truth_file,proposal_file,tiou_thre,subset)
     print("evaluion proposal results...")

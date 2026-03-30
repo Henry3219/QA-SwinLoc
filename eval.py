@@ -61,8 +61,10 @@ def main(args):
     """3. create model and evaluator"""
     # model
     model = make_meta_arch(cfg['model_name'], **cfg['model'])
-    # not ideal for multi GPU training, ok for now
-    model = nn.DataParallel(model, device_ids=cfg['devices'])
+    if len(cfg['devices']) > 1:
+        model = nn.DataParallel(model, device_ids=cfg['devices'])
+    else:
+        model = model.to(cfg['devices'][0])
 
     """4. load ckpt"""
     print("=> loading checkpoint '{}'".format(ckpt_file))
@@ -71,9 +73,13 @@ def main(args):
         ckpt_file,
         map_location = lambda storage, loc: storage.cuda(cfg['devices'][0])
     )
-    # load ema model instead
-    print("Loading from EMA model ...")
-    model.load_state_dict(checkpoint['state_dict_ema'])
+    # load ema model if available, otherwise fallback to standard model
+    if 'state_dict_ema' in checkpoint:
+        print("Loading from EMA model ...")
+        model.load_state_dict(checkpoint['state_dict_ema'])
+    else:
+        print("EMA weights not found, loading base model ...")
+        model.load_state_dict(checkpoint['state_dict'])
     del checkpoint
 
     # set up evaluator

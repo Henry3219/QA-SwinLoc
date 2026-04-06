@@ -656,9 +656,12 @@ class LocalMaskedMMHCA(nn.Module):
             :, :, -(window_overlap + 1) : -1, window_overlap + 1 :
         ]
 
-        diagonal_attention_scores[:, 0, 1:window_overlap, 1:window_overlap] = diagonal_chunked_attention_scores[
-            :, 0, : window_overlap - 1, 1 - window_overlap :
-        ]
+        # When window_overlap == 1 (window_size == 3), this corner slice is empty
+        # on both spatial axes and should be skipped to avoid a shape mismatch.
+        if window_overlap > 1:
+            diagonal_attention_scores[:, 0, 1:window_overlap, 1:window_overlap] = diagonal_chunked_attention_scores[
+                :, 0, : window_overlap - 1, 1 - window_overlap :
+            ]
 
         # separate batch_size and num_heads dimensions again
         diagonal_attention_scores = diagonal_attention_scores.view(
@@ -1098,9 +1101,12 @@ class LocalMaskedMHCA(nn.Module):
             :, :, -(window_overlap + 1) : -1, window_overlap + 1 :
         ]
 
-        diagonal_attention_scores[:, 0, 1:window_overlap, 1:window_overlap] = diagonal_chunked_attention_scores[
-            :, 0, : window_overlap - 1, 1 - window_overlap :
-        ]
+        # When window_overlap == 1 (window_size == 3), this corner slice is empty
+        # on both spatial axes and should be skipped to avoid a shape mismatch.
+        if window_overlap > 1:
+            diagonal_attention_scores[:, 0, 1:window_overlap, 1:window_overlap] = diagonal_chunked_attention_scores[
+                :, 0, : window_overlap - 1, 1 - window_overlap :
+            ]
 
         # separate batch_size and num_heads dimensions again
         diagonal_attention_scores = diagonal_attention_scores.view(

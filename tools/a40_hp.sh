@@ -16,7 +16,7 @@ fi
 cd "$root"
 
 gpu="${GPU:-0}"
-cpu=20
+cpu="${CPU:-6}"
 log="output/UMMAFormer_exp07/tool/log"
 mkdir -p "$log"
 
@@ -55,10 +55,10 @@ train_one() {
     2>&1 | tee "$log/${id}_train.log"
 }
 
-# A800 order:
-# 1. test-set eval for the completed A800 first group
-# 2. train the second A800 group
-# 3. test-set eval for the second A800 group
-eval_one "configs/UMMAFormer/lavdf_q50d50_w33_777_19.yaml" "hp" "lavdf_w33_777_19_post"
-train_one "configs/UMMAFormer/lavdf_q50d50_w19x6.yaml" "hp"
-eval_one "configs/UMMAFormer/lavdf_q50d50_w19x6.yaml" "hp" "lavdf_w19x6_post"
+# A40 order:
+# 1. test-set eval for the completed A40 first group
+# 2. train the second A40 group
+# 3. test-set eval for the second A40 group
+eval_one "configs/UMMAFormer/lavdf_q50d50_w3x6.yaml" "hp" "lavdf_w3x6_post"
+train_one "configs/UMMAFormer/lavdf_q50d50_w7x5_19.yaml" "hp"
+eval_one "configs/UMMAFormer/lavdf_q50d50_w7x5_19.yaml" "hp" "lavdf_w7x5_19_post"

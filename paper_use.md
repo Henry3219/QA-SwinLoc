@@ -123,6 +123,57 @@
 - mAP@0.50 / 0.75 / 0.95: `98.842 / 95.622 / 44.987`
 - AR@10 / 20 / 50 / 100: `92.579 / 92.859 / 92.914 / 92.978`
 
+## Window Length
+- Goal:
+  - test the effect of `n_mha_win_size`
+  - choose whether to keep the default window length setting
+- Suggested table:
+  - keep `base + fpn + qual(0.5) + DFL(0.5)` fixed
+  - use the same fixed post `A`
+- Note:
+  - `lavdf_w7x6_post` is the default `lavdf_q50d50` result
+  - actual default window size used by `convHRLRSwin` is `[7, 7, 7, 7, 7, 7]`
+  - completed test-set results show the default setting is much better than the shorter / mixed-window settings
+
+| Run | actual window size | Status | average-mAP | mAP@0.50 | mAP@0.75 | mAP@0.95 | AR@10 | AR@20 | AR@50 | AR@100 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `lavdf_w7x6_post` | `[7, 7, 7, 7, 7, 7]` | done | `89.128` | `98.923` | `95.809` | `45.773` | `92.639` | `92.862` | `92.927` | `93.000` |
+| `lavdf_w3x6_post` | `[3, 3, 3, 3, 3, 3]` | done | `72.744` | `94.639` | `83.108` | `7.587` | `81.955` | `83.269` | `84.184` | `84.383` |
+| `lavdf_w33_777_19_post` | `[3, 3, 7, 7, 7, 19]` | done | `79.031` | `96.896` | `89.612` | `14.680` | `86.366` | `87.248` | `87.665` | `87.785` |
+| `lavdf_q50d50_w33_777_19_hp` | `[3, 3, 7, 7, 7, 19]` | running | `-` | `-` | `-` | `-` | `-` | `-` | `-` | `-` |
+| `lavdf_q50d50_w7x5_19_hp` | `[7, 7, 7, 7, 7, 19]` | running | `-` | `-` | `-` | `-` | `-` | `-` | `-` | `-` |
+
+### default window
+- Name: `base + fpn + qual(0.5) + DFL(0.5), default window`
+- Run: [lavdf_w7x6_post / q50d50_post_a](/input0/Backup/model/UMMAFormer_exp07/paper_results/q50d50_post/q50d50_post_a/test_results.txt)
+- Actual window size: `[7, 7, 7, 7, 7, 7]`
+- average-mAP: `89.128`
+- mAP@0.50 / 0.75 / 0.95: `98.923 / 95.809 / 45.773`
+- AR@10 / 20 / 50 / 100: `92.639 / 92.862 / 92.927 / 93.000`
+- Use: best completed window-length result
+
+### w3x6
+- Name: `base + fpn + qual(0.5) + DFL(0.5), short window`
+- Run: [lavdf_w3x6_post_a](/output/UMMAFormer_exp07/paper_results/lavdf_w3x6_post/lavdf_w3x6_post_a/test_results.txt)
+- Config: `n_mha_win_size = [3, 3, 3, 3, 3, 3]`
+- average-mAP: `72.744`
+- mAP@0.50 / 0.75 / 0.95: `94.639 / 83.108 / 7.587`
+- AR@10 / 20 / 50 / 100: `81.955 / 83.269 / 84.184 / 84.383`
+- Delta vs default average-mAP: `-16.384`
+
+### w33_777_19
+- Name: `base + fpn + qual(0.5) + DFL(0.5), mixed window`
+- Run: [lavdf_w33_777_19_post_a](/output/UMMAFormer_exp07/paper_results/lavdf_w33_777_19_post/lavdf_w33_777_19_post_a/test_results.txt)
+- Config: `n_mha_win_size = [3, 3, 7, 7, 7, 19]`
+- average-mAP: `79.031`
+- mAP@0.50 / 0.75 / 0.95: `96.896 / 89.612 / 14.680`
+- AR@10 / 20 / 50 / 100: `86.366 / 87.248 / 87.665 / 87.785`
+- Delta vs default average-mAP: `-10.097`
+
+### running
+- `lavdf_q50d50_w33_777_19_hp`: still running according to current experiment note; local directory already has `val_results.txt`, and `lavdf_w33_777_19_post` has a completed test-set post result.
+- `lavdf_q50d50_w7x5_19_hp`: still running; no completed test-set result found yet.
+
 ## Post
 - Goal:
   - show post sensitivity on the final model
